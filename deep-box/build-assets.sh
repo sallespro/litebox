@@ -4,7 +4,7 @@
 set -eu
 HERE="${0:A:h}"; cd "$HERE"
 export DEVELOPER_DIR=/Library/Developer/CommandLineTools
-LB="$HERE/.."
+LB="$HERE/../litebox"
 ALPINE=v3.24
 MIRROR=https://dl-cdn.alpinelinux.org/alpine/$ALPINE/main/aarch64
 PKGS=(htop socat libncursesw ncurses-terminfo-base readline)   # libssl/libcrypto/zlib already in node:alpine

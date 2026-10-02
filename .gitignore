@@ -234,3 +234,8 @@ litebox_packager/manifests/*/apks/
 
 /litebox-serve/.build-agent/
 /litebox-serve/.env
+/deep-box/target/
+/deep-box/deep-box
+/deep-box/assets/*.gz
+/deep-box/.build-agent/
+/deep-box/.env

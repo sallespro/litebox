@@ -1,4 +1,4 @@
-//! litebox-serve: serve a directory over HTTP from a Node.js server running in an
+//! deep-box: serve a directory over HTTP from a Node.js server running in an
 //! Alpine (aarch64 Linux) guest under LiteBox on Apple Silicon, via the HVF backend.
 //! The LiteBox runner and the node:alpine rootfs are embedded in this binary.
 use flate2::read::GzDecoder;
@@ -15,16 +15,22 @@ const RUNNER_GZ: &[u8] = include_bytes!("../assets/runner.gz");
 const ROOTFS_GZ: &[u8] = include_bytes!("../assets/rootfs.tar.gz");
 const ENTITLEMENTS: &[u8] = include_bytes!("../assets/entitlements.plist");
 const SERVER_JS: &[u8] = include_bytes!("../assets/server.js");
+/// dsh-dynamic-agent + a Linux/musl runtime closure of the deepseek harness (see build-agent.sh).
+const AGENT_GZ: &[u8] = include_bytes!("../assets/agent.tar.gz");
 
 const HOST_IP: &str = "10.0.0.1";
 const GUEST_IP: &str = "10.0.0.2";
 
-const USAGE: &str = "usage: litebox-serve [--port N] [--iface utunN] [--selftest PATH] [dir]\n\
+const USAGE: &str = "usage: deep-box [--port N] [--iface utunN] [--selftest PATH] [dir]\n\
+       deep-box --agent [--env-file FILE] [prompt...]\n\
   With a <dir>: serves it as a website. Without: serves an Alpine dashboard (htop + shell terminals).\n\
-  Open http://10.0.0.2:<port> (default 8080). Needs sudo for the utun interface.";
+  Open http://10.0.0.2:<port> (default 8080). Needs sudo for the utun interface.\n\
+  --agent: run the dsh dynamic agent (sallespro/dsh-dynamic-agent) inside the guest and print its answer.\n\
+           Credentials come from --env-file, else .env next to this binary, else ./.env (needs OPENAI_API_KEY).\n\
+           No sudo: the guest reaches the network through LiteBox's rootless outbound proxy.";
 
 fn die(msg: impl std::fmt::Display) -> ! {
-    eprintln!("litebox-serve: {msg}");
+    eprintln!("deep-box: {msg}");
     std::process::exit(1);
 }
 
@@ -38,8 +44,8 @@ fn gunzip_to(data: &[u8], dest: &Path) -> io::Result<()> {
 fn prepare_cache() -> io::Result<(PathBuf, PathBuf)> {
     let home = std::env::var("HOME").map_err(|_| io::Error::other("HOME not set"))?;
     let dir = Path::new(&home)
-        .join(".cache/litebox-serve")
-        .join(format!("{}-{}", RUNNER_GZ.len(), ROOTFS_GZ.len()));
+        .join(".cache/deep-box")
+        .join(format!("{}-{}-{}", RUNNER_GZ.len(), ROOTFS_GZ.len(), AGENT_GZ.len()));
     let runner = dir.join("runner");
     let rootfs = dir.join("rootfs.tar");
     if dir.join(".ready").exists() {
@@ -64,6 +70,103 @@ fn prepare_cache() -> io::Result<(PathBuf, PathBuf)> {
     Ok((runner, rootfs))
 }
 
+/// Base rootfs + the agent closure under /opt/dsh, built once per version and cached.
+fn agent_rootfs(base: &Path) -> io::Result<PathBuf> {
+    let dir = base.parent().expect("rootfs has a parent");
+    let out = dir.join("rootfs-agent.tar");
+    if dir.join(".agent-ready").exists() {
+        return Ok(out);
+    }
+    eprintln!("first agent run: building the agent rootfs (one-off, ~1 min) ...");
+    let gz = dir.join("agent.tar.gz");
+    let tree = dir.join("agent");
+    let _ = fs::remove_dir_all(&tree);
+    fs::create_dir_all(&tree)?;
+    fs::write(&gz, AGENT_GZ)?;
+    let run = |cmd: &mut Command, what: &str| -> io::Result<()> {
+        if cmd.status()?.success() { Ok(()) } else { Err(io::Error::other(format!("{what} failed"))) }
+    };
+    run(Command::new("/usr/bin/tar").arg("-xzf").arg(&gz).arg("-C").arg(&tree), "unpacking the agent")?;
+    // APFS clone (instant, copy-on-write); fall back to a plain copy elsewhere.
+    let _ = fs::remove_file(&out);
+    if !Command::new("/bin/cp").arg("-c").arg(base).arg(&out).status().map(|s| s.success()).unwrap_or(false) {
+        fs::copy(base, &out)?;
+    }
+    // bsdtar -r appends at the true end of the archive; hand-concatenated tars are not read correctly by LiteBox.
+    run(
+        Command::new("/usr/bin/tar").env("COPYFILE_DISABLE", "1").arg("-rf").arg(&out).arg("-C").arg(&tree).arg("opt/dsh"),
+        "adding the agent to the rootfs",
+    )?;
+    let _ = fs::remove_dir_all(&tree);
+    let _ = fs::remove_file(&gz);
+    fs::write(dir.join(".agent-ready"), b"")?;
+    Ok(out)
+}
+
+/// Locate the credentials file: --env-file, else .env beside the executable, else ./.env.
+fn find_env_file(explicit: Option<String>) -> PathBuf {
+    if let Some(p) = explicit {
+        let p = PathBuf::from(p);
+        if !p.is_file() {
+            die(format!("--env-file {} not found", p.display()));
+        }
+        return p;
+    }
+    let beside = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(".env")));
+    for cand in beside.into_iter().chain([PathBuf::from(".env")]) {
+        if cand.is_file() {
+            return cand;
+        }
+    }
+    die("no .env found (looked beside the binary and in the current directory); create one with OPENAI_API_KEY=... or pass --env-file")
+}
+
+/// Run the dsh dynamic agent once in the guest, with the credentials staged as a file in a private temp dir
+/// (never on a command line), and exit with its status.
+fn run_agent(runner: &Path, base: &Path, env_file: PathBuf, prompt: Vec<String>) -> ! {
+    let creds = fs::read(&env_file).unwrap_or_else(|e| die(format!("cannot read {}: {e}", env_file.display())));
+    if !String::from_utf8_lossy(&creds).lines().any(|l| l.trim_start().starts_with("OPENAI_API_KEY=")) {
+        eprintln!("deep-box: warning: {} has no OPENAI_API_KEY=... line", env_file.display());
+    }
+    let agent_base = agent_rootfs(base).unwrap_or_else(|e| die(format!("agent setup failed: {e}")));
+
+    let work = std::env::temp_dir().join(format!("deep-box-agent-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&work);
+    fs::create_dir_all(work.join("stage/opt/dsh/agent")).unwrap_or_else(|e| die(e));
+    fs::set_permissions(&work, fs::Permissions::from_mode(0o700)).unwrap_or_else(|e| die(e));
+    let env_in_stage = work.join("stage/opt/dsh/agent/.env");
+    fs::write(&env_in_stage, creds).unwrap_or_else(|e| die(e));
+    fs::set_permissions(&env_in_stage, fs::Permissions::from_mode(0o600)).unwrap_or_else(|e| die(e));
+
+    let tar = work.join("rootfs.tar");
+    if !Command::new("/bin/cp").arg("-c").arg(&agent_base).arg(&tar).status().map(|s| s.success()).unwrap_or(false) {
+        fs::copy(&agent_base, &tar).unwrap_or_else(|e| die(e));
+    }
+    let st = Command::new("/usr/bin/tar")
+        .env("COPYFILE_DISABLE", "1")
+        .arg("-rf").arg(&tar).arg("-C").arg(work.join("stage")).arg("opt/dsh/agent/.env")
+        .status().unwrap_or_else(|e| die(e));
+    if !st.success() {
+        die("failed to stage the credentials");
+    }
+
+    let mut cmd = Command::new(runner);
+    cmd.args(["--unstable", "--hvf", "--guest-root", "--net-proxy"])
+        .args(["--env", "NODE_USE_ENV_PROXY=1", "--env", "HOME=/root"])
+        .args(["--env", "DSH_BIN=/opt/dsh/lib/bin.js", "--env", "DSH_HOME=/opt/dsh/home"])
+        .arg("--initial-files").arg(&tar)
+        .args(["/usr/local/bin/node", "/opt/dsh/agent/dsh-dynamic-agent.mjs"]);
+    if !prompt.is_empty() {
+        cmd.arg(prompt.join(" "));
+    }
+    let code = cmd.status().map(|s| s.code().unwrap_or(1)).unwrap_or_else(|e| {
+        eprintln!("deep-box: failed to start runner: {e}");
+        1
+    });
+    let _ = fs::remove_dir_all(&work);
+    std::process::exit(code);
+}
+
 fn sudo(args: &[&str]) -> bool {
     Command::new("sudo").args(args).status().map(|s| s.success()).unwrap_or(false)
 }
@@ -73,19 +176,35 @@ fn main() {
     let mut iface = "utun9".to_string(); // high unit to avoid VPN utuns
     let mut selftest: Option<String> = None;
     let mut dir: Option<String> = None; // None => built-in Alpine dashboard
+    let mut agent = false;
+    let mut env_file: Option<String> = None;
+    let mut rest: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--port" => port = args.next().unwrap_or_else(|| die(USAGE)),
             "--iface" => iface = args.next().unwrap_or_else(|| die(USAGE)),
             "--selftest" => selftest = Some(args.next().unwrap_or_else(|| die(USAGE))),
+            "--agent" => agent = true,
+            "--env-file" => env_file = Some(args.next().unwrap_or_else(|| die(USAGE))),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return;
             }
-            _ if dir.is_none() => dir = Some(a),
-            _ => die(USAGE),
+            _ => rest.push(a),
         }
+    }
+    if agent {
+        let (runner, base) = prepare_cache().unwrap_or_else(|e| die(format!("setup failed: {e}")));
+        run_agent(&runner, &base, find_env_file(env_file), rest);
+    }
+    if env_file.is_some() {
+        die("--env-file only applies with --agent");
+    }
+    let mut rest = rest.into_iter();
+    dir = rest.next();
+    if rest.next().is_some() {
+        die(USAGE);
     }
     let dir = dir.map(|d| {
         let d = fs::canonicalize(d).unwrap_or_else(|e| die(format!("cannot open directory: {e}")));
@@ -102,7 +221,7 @@ fn main() {
 
     // With a directory: per-run rootfs = base + /app/server.js + /www (a copy of the served dir).
     // Without one: the base rootfs already contains the dashboard at /dash.
-    let work = std::env::temp_dir().join(format!("litebox-serve-{}", std::process::id()));
+    let work = std::env::temp_dir().join(format!("deep-box-{}", std::process::id()));
     let tar = match &dir {
         Some(dir) => {
             let stage = work.join("stage");
