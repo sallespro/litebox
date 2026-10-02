@@ -225,3 +225,9 @@ litebox_packager/manifests/*/apks/
 
 # gm/agentplug harness runtime spool (dispatch outputs, regenerated every session)
 .agentplug/
+
+# local build outputs / artifacts
+/*.tar
+/litebox-serve/target/
+/litebox-serve/litebox-serve
+/litebox-serve/assets/*.gz
