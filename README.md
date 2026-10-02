@@ -23,6 +23,20 @@ Example use cases include:
 
 ![LiteBox and related projects](./.figures/litebox.svg)
 
+## Example: a Node.js web server on Apple Silicon
+
+Unmodified Linux (aarch64) programs run natively on an Apple Silicon Mac: the guest's instructions execute on the CPU
+through Hypervisor.framework (`--hvf`), and only the system interface is virtualized. The diagram shows the layers when
+a Node.js server in an Alpine guest is opened from the host browser.
+
+<p align="center">
+  <img src="./.figures/litebox-macos-hvf-layers.svg" alt="Layers: host browser, Linux guest (Node.js on Alpine), HVF guest execution, LiteBox Linux shim, macOS platform layer, Apple Silicon host" width="560">
+</p>
+
+See [docs/macos.md](./docs/macos.md) for the platform details, [`litebox-serve`](./litebox-serve) for a single binary that
+serves a directory (or an Alpine dashboard) this way, and [`deep-box`](./deep-box) for the same plus running the dsh agent
+in the guest.
+
 ## Contributing
 
 See the following files for details:
