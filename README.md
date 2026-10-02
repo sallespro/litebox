@@ -23,14 +23,14 @@ Example use cases include:
 
 ![LiteBox and related projects](./.figures/litebox.svg)
 
-## Example: a Node.js web server on Apple Silicon
+## Example: Node.js and the dsh agent on Apple Silicon
 
 Unmodified Linux (aarch64) programs run natively on an Apple Silicon Mac: the guest's instructions execute on the CPU
 through Hypervisor.framework (`--hvf`), and only the system interface is virtualized. The diagram shows the layers when
-a Node.js server in an Alpine guest is opened from the host browser.
+a Node.js server in an Alpine guest is opened from the host browser (web mode), or the dsh agent runs in the guest and calls OpenAI (agent mode).
 
 <p align="center">
-  <img src="./.figures/litebox-macos-hvf-layers.svg" alt="Layers: host browser, Linux guest (Node.js on Alpine), HVF guest execution, LiteBox Linux shim, macOS platform layer, Apple Silicon host" width="560">
+  <img src="./.figures/litebox-macos-hvf-layers.svg" alt="Layers: host browser and OpenAI API, Linux guest (web mode and the dsh agent with its plugins, on Node.js and Alpine), HVF guest execution, LiteBox Linux shim, macOS platform layer, Apple Silicon host" width="600">
 </p>
 
 See [docs/macos.md](./docs/macos.md) for the platform details, [`litebox-serve`](./litebox-serve) for a single binary that
