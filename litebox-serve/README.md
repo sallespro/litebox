@@ -28,3 +28,23 @@ macOS 26.x `SDKROOT` (see `../run-litebox.sh`).
 
 Other helpers at the repo root: `run-litebox.sh` (run any program from an Alpine image) and
 `serve-node.sh` (minimal Node server demo).
+
+## Running the dsh agent (`--agent`)
+
+```sh
+echo 'OPENAI_API_KEY=sk-...' > .env          # next to the binary (or pass --env-file FILE)
+./litebox-serve --agent "fetch https://example.com and summarize it"
+```
+
+Runs [sallespro/dsh-dynamic-agent](https://github.com/sallespro/dsh-dynamic-agent) inside the Alpine guest and prints the
+answer. No sudo and no utun: the guest reaches OpenAI and the web through LiteBox's rootless outbound proxy
+(`--net-proxy`). The `.env` is staged as a file in a private temp dir (never on a command line) and deleted afterwards;
+it is not embedded in the binary.
+
+`./build-agent.sh` builds `assets/agent.tar.gz` (pinned deepseek-harness + agent commits): it builds the harness on the
+host, `pnpm deploy`s a linux/arm64/musl runtime closure, fills in workspace packages the deploy omits, prunes it and lays
+it out under `/opt/dsh`. The agent script gets one patch (`agent/patch-agent.mjs`): the current dsh SDK client no longer
+reads the `launch:` option the script used, so it silently started a stock dsh with no OpenAI route.
+
+LiteBox needed one fix for this: `msync` was unimplemented, and the harness's native "require builtin" addon uses it as a
+pointer-validity probe (`litebox_shim_linux::sys_msync`). The guest runs with `--guest-root` so the harness home is writable.

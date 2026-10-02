@@ -231,3 +231,6 @@ litebox_packager/manifests/*/apks/
 /litebox-serve/target/
 /litebox-serve/litebox-serve
 /litebox-serve/assets/*.gz
+
+/litebox-serve/.build-agent/
+/litebox-serve/.env

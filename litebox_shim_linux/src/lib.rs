@@ -1571,6 +1571,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 session.close();
                 result
             }
+            SyscallRequest::Msync {
+                addr,
+                length,
+                flags,
+            } => self.sys_msync(addr, length, flags),
             SyscallRequest::Dup {
                 oldfd,
                 newfd,

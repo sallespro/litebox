@@ -1180,6 +1180,53 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         litebox_common_linux::mm::sys_madvise(&self.global.pm, addr, len, advice)
     }
 
+    /// `msync(2)`: there is no file-backed write-back to flush here (guest file mappings are
+    /// private copies), so this only reproduces the argument and mapping validation. That is
+    /// what callers actually rely on, e.g. as a cheap "is this pointer mapped?" probe (Node
+    /// native addons use it): `ENOMEM` when any page of the range is unmapped, `EINVAL` for a
+    /// misaligned address, unknown flags, or `MS_ASYNC` together with `MS_SYNC`.
+    pub(crate) fn sys_msync(
+        &self,
+        addr: UserPtrMut<u8>,
+        len: usize,
+        flags: i32,
+    ) -> Result<usize, Errno> {
+        const MS_ASYNC: i32 = 1;
+        const MS_INVALIDATE: i32 = 2;
+        const MS_SYNC: i32 = 4;
+        let start = addr.as_usize();
+        if start & (litebox::mm::linux::PAGE_SIZE - 1) != 0
+            || flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+            || (flags & MS_ASYNC != 0 && flags & MS_SYNC != 0)
+        {
+            return Err(Errno::EINVAL);
+        }
+        if len == 0 {
+            return Ok(0);
+        }
+        let Some(end) = start.checked_add(len.next_multiple_of(litebox::mm::linux::PAGE_SIZE))
+        else {
+            return Err(Errno::ENOMEM);
+        };
+        // Walk the mappings in address order and require them to cover all of [start, end).
+        let mut mappings = self.global.pm.mappings();
+        mappings.sort_by_key(|(range, _)| range.start);
+        let mut cursor = start;
+        for (range, _) in mappings {
+            if range.end <= cursor {
+                continue;
+            }
+            if range.start > cursor {
+                break;
+            }
+            cursor = range.end;
+            if cursor >= end {
+                return Ok(0);
+            }
+        }
+        Err(Errno::ENOMEM)
+    }
+
     // ── Runtime ELF syscall patching ─────────────────────────────────────
 
     /// Check all tracked file mappings for unpatched regions that overlap the
